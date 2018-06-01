@@ -126,17 +126,35 @@ func (c *fsCache) loadExistingFiles() {
 	}
 }
 
+// ZeroCheckWriter is a writer that keeps track of whether or not a stream contains
+// non-zero bytes. This is useful to work around a Bazel bug where all-zero bytes
+// are uploaded to the cache.
+type ZeroCheckWriter struct {
+	hasNoZeros bool // use unfriendly negation to preserve default-initialization
+}
+
+func (r *ZeroCheckWriter) Write(p []byte) (n int, e error) {
+	for _, b := range p {
+		if b != 0 {
+			r.hasNoZeros = true
+		}
+	}
+	return len(p), nil
+}
+
 func (c *fsCache) Put(key string, size int64, expectedSha256 string, r io.Reader) (err error) {
 	c.mux.Lock()
 
-	// If `key` is already in the LRU, don't touch the cache and just discard
-	// the incoming stream. This applies to both committed an uncommitted files
-	// (we don't want to upload again if an upload of the same file is already
-	// in progress).
-	if _, found := c.lru.Get(key); found {
-		c.mux.Unlock()
-		io.Copy(ioutil.Discard, r)
-		return
+	// If there's an ongoing upload (i.e. cache key is present in uncommitted state),
+	// we drop the upload and discard the incoming stream. We do accept uploads
+	// of existing keys, as it should happen relatively rarely (e.g. race
+	// condition on the bazel side) but it's useful to overwrite poisoned items.
+	if existingItem, found := c.lru.Get(key); found {
+		if !existingItem.(*lruItem).committed {
+			c.mux.Unlock()
+			io.Copy(ioutil.Discard, r)
+			return
+		}
 	}
 
 	// Try to add the item to the LRU.
@@ -172,9 +190,11 @@ func (c *fsCache) Put(key string, size int64, expectedSha256 string, r io.Reader
 	}
 	defer os.Remove(f.Name())
 
+	zeroChecker := &ZeroCheckWriter{}
+
 	if expectedSha256 != "" {
 		hasher := sha256.New()
-		if _, err = io.Copy(io.MultiWriter(f, hasher), r); err != nil {
+		if _, err = io.Copy(io.MultiWriter(f, hasher, zeroChecker), r); err != nil {
 			return
 		}
 		actualHash := hex.EncodeToString(hasher.Sum(nil))
@@ -184,9 +204,15 @@ func (c *fsCache) Put(key string, size int64, expectedSha256 string, r io.Reader
 			return
 		}
 	} else {
-		if _, err = io.Copy(f, r); err != nil {
+		if _, err = io.Copy(io.MultiWriter(f, zeroChecker), r); err != nil {
 			return
 		}
+	}
+
+	// Discard all-zero blobs, which are often (likely always) a result of a bazel bug.
+	if !zeroChecker.hasNoZeros && size > 0 {
+		err = errors.New("uploaded a file of all zeros!")
+		return
 	}
 
 	if err := f.Sync(); err != nil {
