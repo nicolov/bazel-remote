@@ -191,10 +191,11 @@ func (c *fsCache) Put(key string, size int64, expectedSha256 string, r io.Reader
 	defer os.Remove(f.Name())
 
 	zeroChecker := &ZeroCheckWriter{}
+	var copiedSize int64
 
 	if expectedSha256 != "" {
 		hasher := sha256.New()
-		if _, err = io.Copy(io.MultiWriter(f, hasher, zeroChecker), r); err != nil {
+		if copiedSize, err = io.Copy(io.MultiWriter(f, hasher, zeroChecker), r); err != nil {
 			return
 		}
 		actualHash := hex.EncodeToString(hasher.Sum(nil))
@@ -204,9 +205,15 @@ func (c *fsCache) Put(key string, size int64, expectedSha256 string, r io.Reader
 			return
 		}
 	} else {
-		if _, err = io.Copy(io.MultiWriter(f, zeroChecker), r); err != nil {
+		if copiedSize, err = io.Copy(io.MultiWriter(f, zeroChecker), r); err != nil {
 			return
 		}
+	}
+
+	// Discard empty blobs, which are likely a bazel bug.
+	if copiedSize == 0 {
+		err = errors.New("uploaded an empty file")
+		return
 	}
 
 	// Discard all-zero blobs, which are often (likely always) a result of a bazel bug.

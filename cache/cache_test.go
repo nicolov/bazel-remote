@@ -227,6 +227,17 @@ func TestCacheCorruptedFile(t *testing.T) {
 	}
 }
 
+func TestCacheEmptyFile(t *testing.T) {
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+	cache := NewFsCache(cacheDir, 1000)
+
+	err := cache.Put(KEY, int64(4), "", bytes.NewReader([]byte{}))
+	if err == nil {
+		t.Fatal("expected rejected empty file")
+	}
+}
+
 func TestCacheZeroFile(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
